@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.env
+venv/
+env/
+*.venv
+
+# Models (large binary files)
+models/*.pkl
+models/*.txt
+models/*.bin
+
+# Live state and trade logs (runtime generated)
+live_state.json
+trade_log.jsonl
+
+# Node / React
+dashboard-ui/node_modules/
+dashboard-ui/dist/
+dashboard-ui/.vite/
+dashboard-ui/error.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Secrets / API keys
+.env.local
+secrets.py
