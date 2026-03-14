@@ -105,8 +105,27 @@ def predict(payload: FeatureData):
             class_map = {0: -1, 1: 0, 2: 1}
             prediction = class_map[pred_idx]
 
+        raw_confidence = float(confidence)
+
+        # ── Real-time risk-aware confidence shaping (news + volatility) ──────
+        news_impact = float(features.get("news_impact_score", 0.0))
+        high_volatility = int(features.get("high_volatility", 0))
+
+        penalty = 0.0
+        penalty += min(0.08, max(0.0, news_impact) * 0.08)
+        penalty += 0.03 if high_volatility == 1 else 0.0
+
+        confidence = float(np.clip(raw_confidence - penalty, 0.50, 0.97))
+
         trend_map = {1: "bullish", 0: "neutral", -1: "bearish"}
         trend = trend_map.get(prediction, "neutral")
+
+        if confidence >= 0.80:
+            conf_band = "high"
+        elif confidence >= 0.65:
+            conf_band = "medium"
+        else:
+            conf_band = "low"
 
         log_prediction(features, prediction, confidence, trend)
 
@@ -114,7 +133,10 @@ def predict(payload: FeatureData):
             "status":     "success",
             "prediction": prediction,
             "trend":      trend,
+            "raw_confidence": round(raw_confidence, 4),
             "confidence": round(confidence, 4),
+            "confidence_band": conf_band,
+            "confidence_penalty": round(penalty, 4),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

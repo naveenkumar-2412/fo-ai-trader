@@ -9,10 +9,14 @@ parser = argparse.ArgumentParser(description="AI F&O Trading Orchestrator")
 parser.add_argument("--symbol", default="NIFTY", choices=["NIFTY", "BANKNIFTY", "FINIFTY"],
                     help="Instrument to trade (default: NIFTY)")
 parser.add_argument("--dry-run", action="store_true", help="Log signals without placing orders")
+parser.add_argument("--simulation", action="store_true", help="Run real-time prediction simulation (always paper mode)")
+parser.add_argument("--interval-sec", type=int, default=15, help="Cycle interval in seconds (default: 15)")
 args, _ = parser.parse_known_args()
 
 SYMBOL    = args.symbol
-DRY_RUN   = args.dry_run
+SIMULATION_MODE = args.simulation
+DRY_RUN   = args.dry_run or SIMULATION_MODE
+INTERVAL_SEC = max(5, args.interval_sec)
 
 # ─── Service endpoints ─────────────────────────────────────────────────────────
 MARKET_URL    = "http://localhost:8001"
@@ -21,18 +25,39 @@ PREDICTION_URL= "http://localhost:8003"
 STRATEGY_URL  = "http://localhost:8004"
 RISK_URL      = "http://localhost:8005"
 EXECUTION_URL = "http://localhost:8006"
+NEWS_URL      = "http://localhost:8008"
+EVENT_BUS_URL = "http://localhost:8009"
 
 LIVE_STATE_FILE = "live_state.json"
 TRADE_LOG_FILE  = "trade_log.jsonl"
 SIGNAL_LOG_FILE = "signal_log.jsonl"
+SIMULATION_LOG_FILE = "simulation_log.jsonl"
 
 active_trade = None
+
+
+def publish_event(stage: str, event_type: str, payload: dict):
+    try:
+        requests.post(
+            f"{EVENT_BUS_URL}/publish",
+            json={
+                "event_type": event_type,
+                "symbol": SYMBOL,
+                "stage": stage,
+                "payload": payload,
+            },
+            timeout=2,
+        )
+    except Exception:
+        pass
 
 
 # ─── Startup health check ──────────────────────────────────────────────────────
 def health_check() -> bool:
     services = {
         "Market Data":  f"{MARKET_URL}/quote?symbol={SYMBOL}",
+        "News":         f"{NEWS_URL}/health",
+        "Event Bus":    f"{EVENT_BUS_URL}/health",
         "Feature Engine": f"{FEATURE_URL}/docs",
         "Prediction":   f"{PREDICTION_URL}/docs",
         "Strategy":     f"{STRATEGY_URL}/docs",
@@ -76,12 +101,21 @@ def log_trade(entry: dict):
         pass
 
 
+def log_simulation(entry: dict):
+    try:
+        with open(SIMULATION_LOG_FILE, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
+
+
 # ─── Trading cycle ─────────────────────────────────────────────────────────────
 def run_trading_cycle():
     global active_trade
 
     now = datetime.now()
     print(f"\n--- Cycle: {now.strftime('%H:%M:%S')} | {SYMBOL} ---")
+    publish_event("cycle", "cycle_started", {"time": now.isoformat(), "dry_run": DRY_RUN})
 
     # ── 1. Spot price (fast quote) ────────────────────────────────────────────
     try:
@@ -90,8 +124,10 @@ def run_trading_cycle():
             print("  [ERR] Quote fetch failed")
             return
         current_price = float(r.json()["price"])
+        publish_event("market_data", "quote_fetched", {"price": current_price})
     except Exception as e:
         print(f"  [ERR] Quote: {e}")
+        publish_event("market_data", "quote_failed", {"error": str(e)})
         return
 
     current_state = {
@@ -99,6 +135,7 @@ def run_trading_cycle():
         "current_price": current_price,
         "is_live":       True,
         "dry_run":       DRY_RUN,
+        "simulation_mode": SIMULATION_MODE,
         "timestamp":     now.isoformat(),
         "active_trade":  None,
         "prediction":    None,
@@ -193,6 +230,7 @@ def run_trading_cycle():
                     requests.post(f"{RISK_URL}/update_pnl",
                                   json={"pnl": net_pnl, "exposure_released": closed.get("entry_price", 0) * closed.get("qty", 1)},
                                   timeout=3)
+                    publish_event("execution", "order_closed", {"order_id": closed.get("order_id"), "pnl": net_pnl, "reason": exit_reason})
             active_trade = None
             current_state["active_trade"] = None
 
@@ -205,8 +243,10 @@ def run_trading_cycle():
     try:
         r = requests.get(f"{MARKET_URL}/candles", params={"symbol": SYMBOL, "timeframe": "1m"}, timeout=10)
         candles = r.json()["data"]
+        publish_event("market_data", "candles_fetched", {"count": len(candles)})
     except Exception as e:
         print(f"  [ERR] Candles: {e}")
+        publish_event("market_data", "candles_failed", {"error": str(e)})
         save_live_state(current_state)
         return
 
@@ -215,8 +255,10 @@ def run_trading_cycle():
         r = requests.post(f"{FEATURE_URL}/generate_features",
                           json={"data": candles, "symbol": SYMBOL}, timeout=10)
         features = r.json()["features"]
+        publish_event("features", "features_generated", {"keys": list(features.keys())[:10], "count": len(features)})
     except Exception as e:
         print(f"  [ERR] Features: {e}")
+        publish_event("features", "features_failed", {"error": str(e)})
         save_live_state(current_state)
         return
 
@@ -231,9 +273,11 @@ def run_trading_cycle():
             "trend": trend, "confidence": confidence,
             "snapshot": {k: features.get(k) for k in ["rsi", "adx", "vwap_dist", "pcr", "atr_pct"]}
         }
+        publish_event("prediction", "prediction_created", {"trend": trend, "confidence": confidence})
         save_live_state(current_state)
     except Exception as e:
         print(f"  [ERR] Predict: {e}")
+        publish_event("prediction", "prediction_failed", {"error": str(e)})
         save_live_state(current_state)
         return
 
@@ -244,13 +288,28 @@ def run_trading_cycle():
                                 "trend": trend, "confidence": confidence,
                                 "features": features}, timeout=5)
         signal_data = r.json().get("signal")
+        publish_event("strategy", "signal_evaluated", {"has_signal": isinstance(signal_data, dict), "signal": signal_data if isinstance(signal_data, dict) else "no_trade"})
     except Exception as e:
         print(f"  [ERR] Strategy: {e}")
+        publish_event("strategy", "signal_failed", {"error": str(e)})
         return
 
     if signal_data == "no_trade" or not isinstance(signal_data, dict):
         reason = r.json().get("reason", "Filtered out")
         print(f"  => No trade: {reason}")
+        publish_event("strategy", "no_trade", {"reason": reason})
+        if SIMULATION_MODE:
+            log_simulation({
+                "time": now.isoformat(),
+                "symbol": SYMBOL,
+                "spot": current_price,
+                "trend": trend,
+                "confidence": confidence,
+                "prediction": pred_data.get("prediction"),
+                "signal": "no_trade",
+                "reason": reason,
+                "snapshot": current_state.get("prediction", {}).get("snapshot", {}),
+            })
         return
 
     print(f"  Signal => {signal_data['action']} | SL:{signal_data['sl_pct']:.0%} Tgt:{signal_data['target_pct']:.0%}")
@@ -261,6 +320,7 @@ def run_trading_cycle():
         risk = r.json()
         if not risk.get("allowed"):
             print(f"  => Risk block: {risk.get('reason')}")
+            publish_event("risk", "risk_blocked", {"reason": risk.get("reason")})
             return
 
         r = requests.post(f"{RISK_URL}/calculate_quantity",
@@ -271,10 +331,13 @@ def run_trading_cycle():
         qty = qty_data.get("quantity", 0)
         if qty <= 0:
             print(f"  => Qty=0: {qty_data.get('reason', 'Margin/Risk limit')}")
+            publish_event("risk", "quantity_zero", {"reason": qty_data.get("reason", "risk")})
             return
         print(f"  Qty => {qty} units | Kelly={qty_data.get('kelly_fraction', 0):.3f}")
+        publish_event("risk", "quantity_calculated", {"qty": qty, "kelly": qty_data.get("kelly_fraction", 0)})
     except Exception as e:
         print(f"  [ERR] Risk: {e}")
+        publish_event("risk", "risk_failed", {"error": str(e)})
         return
 
     # 7. Place order
@@ -283,6 +346,20 @@ def run_trading_cycle():
 
     if DRY_RUN:
         print(f"  [DRY RUN] Would place: {instrument} x{qty}")
+        publish_event("execution", "dry_run_order", {"instrument": instrument, "qty": qty, "action": signal_data.get("action")})
+        if SIMULATION_MODE:
+            log_simulation({
+                "time": now.isoformat(),
+                "symbol": SYMBOL,
+                "spot": current_price,
+                "trend": trend,
+                "confidence": confidence,
+                "prediction": pred_data.get("prediction"),
+                "signal": signal_data,
+                "instrument": instrument,
+                "qty": qty,
+                "snapshot": current_state.get("prediction", {}).get("snapshot", {}),
+            })
         return
 
     try:
@@ -297,6 +374,7 @@ def run_trading_cycle():
             return
         order = r.json()["order"]
         print(f"  ORDER PLACED: {order['order_id']} @ Rs{order['entry_price']}")
+        publish_event("execution", "order_placed", {"order_id": order.get("order_id"), "instrument": instrument, "qty": qty, "entry_price": order.get("entry_price")})
 
         log_trade({"time": now.isoformat(), "order": order, "signal": signal_data})
 
@@ -320,6 +398,7 @@ def run_trading_cycle():
 
     except Exception as e:
         print(f"  [ERR] Order placement: {e}")
+        publish_event("execution", "order_failed", {"error": str(e)})
 
 
 # ─── Main loop ─────────────────────────────────────────────────────────────────
@@ -327,11 +406,12 @@ if __name__ == "__main__":
     if not health_check():
         print("[WARN] Some services are offline. Proceeding anyway...")
 
-    print(f"Starting trading loop for {SYMBOL}...\n")
+    mode = "SIMULATION" if SIMULATION_MODE else ("DRY RUN" if DRY_RUN else "LIVE")
+    print(f"Starting trading loop for {SYMBOL} [{mode}]...\n")
     while True:
         try:
             run_trading_cycle()
         except Exception as e:
             print(f"  [CRITICAL] Cycle error: {e}")
-        print(f"  Sleeping 15s...")
-        time.sleep(15)
+        print(f"  Sleeping {INTERVAL_SEC}s...")
+        time.sleep(INTERVAL_SEC)

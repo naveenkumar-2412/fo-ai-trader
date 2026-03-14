@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import {
   Activity, TrendingUp, TrendingDown, BarChart2, Shield,
-  Zap, AlertTriangle, RefreshCw, ChevronUp, ChevronDown
+  Zap, AlertTriangle, RefreshCw, Play, Square
 } from 'lucide-react';
 
 const API = 'http://localhost:8007';
@@ -96,16 +96,23 @@ export default function App() {
   const [error,       setError]       = useState(false);
   const [activeTab,   setActiveTab]   = useState('overview');
   const [symbol,      setSymbol]      = useState('NIFTY');
+  const [orchestrator,setOrchestrator]= useState(null);
+  const [simData,     setSimData]     = useState(null);
+  const [mode,        setMode]        = useState('simulation');
+  const [intervalSec, setIntervalSec] = useState(15);
+  const [busy,        setBusy]        = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [s, m, eq, sig, fi, rs] = await Promise.all([
+      const [s, m, eq, sig, fi, rs, orch, sim] = await Promise.all([
         axios.get(`${API}/api/state`),
         axios.get(`${API}/api/metrics`),
         axios.get(`${API}/api/equity_curve`),
         axios.get(`${API}/api/signals`),
         axios.get(`${API}/api/feature_importance`),
         axios.get(`${API}/api/risk_status`),
+        axios.get(`${API}/api/orchestrator/status`),
+        axios.get(`${API}/api/simulation`, { params: { limit: 100 } }),
       ]);
       setState(s.data);
       setMetrics(m.data);
@@ -113,11 +120,45 @@ export default function App() {
       setSignals(sig.data?.data || []);
       setFeatImp(fi.data?.data || null);
       setRiskStatus(rs.data?.data || null);
+      setOrchestrator(orch.data?.data || null);
+      setSimData(sim.data || null);
       setError(false);
     } catch {
       setError(true);
     }
   }, []);
+
+  useEffect(() => {
+    if (orchestrator?.running) {
+      if (orchestrator?.symbol) setSymbol(orchestrator.symbol);
+      if (orchestrator?.mode) setMode(orchestrator.mode);
+      if (orchestrator?.interval_sec) setIntervalSec(orchestrator.interval_sec);
+    }
+  }, [orchestrator]);
+
+  const startOrchestrator = async () => {
+    try {
+      setBusy(true);
+      await axios.post(`${API}/api/orchestrator/start`, {
+        symbol,
+        mode,
+        interval_sec: Number(intervalSec),
+      });
+      await fetchAll();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stopOrchestrator = async () => {
+    try {
+      setBusy(true);
+      await axios.post(`${API}/api/orchestrator/stop`);
+      await fetchAll();
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     fetchAll();
@@ -134,6 +175,7 @@ export default function App() {
   const isBear    = trend === 'bearish';
   const isLive    = state?.is_live;
   const risk      = riskStatus;
+  const orchRun   = orchestrator?.running;
 
   const fmtPct    = v => `${v >= 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
   const fmtRs     = v => `Rs ${Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
@@ -161,7 +203,8 @@ export default function App() {
         <ul className="nav-links">
           {[['overview','Overview', <BarChart2 size={18}/>],
             ['signals', 'Signal Trace', <Activity size={18}/>],
-            ['features','Feature Imp.', <TrendingUp size={18}/>]].map(([t, l, ic]) => (
+            ['features','Feature Imp.', <TrendingUp size={18}/>],
+            ['simulation','Simulation', <Activity size={18}/>]].map(([t, l, ic]) => (
             <li key={t} className={activeTab === t ? 'active' : ''} onClick={() => setActiveTab(t)}>
               {ic} {l}
             </li>
@@ -172,7 +215,7 @@ export default function App() {
           <div className={`status-dot ${isLive && !error ? 'live' : 'offline'}`} />
           <div>
             <div style={{fontSize:'0.8rem', fontWeight:600}}>{error ? 'API Offline' : isLive ? 'System Live' : 'Standby'}</div>
-            <div style={{fontSize:'0.7rem', color:'var(--text-muted)'}}>Updates every 3s</div>
+            <div style={{fontSize:'0.7rem', color:'var(--text-muted)'}}>{orchRun ? `Orchestrator ${orchestrator?.mode || ''}` : 'Updates every 3s'}</div>
           </div>
         </div>
       </aside>
@@ -210,6 +253,39 @@ export default function App() {
         {/* ════════════ OVERVIEW TAB ════════════ */}
         {activeTab === 'overview' && (
           <>
+            <div className="glass-panel" style={{ marginBottom: '1.5rem' }}>
+              <div className="panel-header">
+                <h3>Web Control Center</h3>
+                <span className={`badge ${orchRun ? 'badge-bull' : ''}`}>{orchRun ? 'Running' : 'Stopped'}</span>
+              </div>
+              <div className="control-grid">
+                <div className="control-item">
+                  <label>Mode</label>
+                  <select value={mode} onChange={(e) => setMode(e.target.value)} disabled={orchRun || busy}>
+                    <option value="simulation">Simulation</option>
+                    <option value="dry-run">Dry Run</option>
+                    <option value="live">Live</option>
+                  </select>
+                </div>
+                <div className="control-item">
+                  <label>Interval (sec)</label>
+                  <input type="number" min="5" max="300" value={intervalSec}
+                         onChange={(e) => setIntervalSec(e.target.value)} disabled={orchRun || busy} />
+                </div>
+                <div className="control-actions">
+                  {!orchRun ? (
+                    <button className="btn-primary" onClick={startOrchestrator} disabled={busy}>
+                      <Play size={14} /> Start
+                    </button>
+                  ) : (
+                    <button className="btn-danger" onClick={stopOrchestrator} disabled={busy}>
+                      <Square size={14} /> Stop
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
             {/* Metrics Row */}
             <div className="metrics-grid">
               {[
@@ -369,6 +445,42 @@ export default function App() {
               ? <FeatureImportance data={featImp} />
               : <p className="empty-text">Feature importance not yet available. Train the model first.</p>
             }
+          </div>
+        )}
+
+        {activeTab === 'simulation' && (
+          <div className="glass-panel">
+            <div className="panel-header">
+              <h3>Real-time Simulation</h3>
+              <button className="btn-secondary" onClick={fetchAll}>
+                <RefreshCw size={14}/> Refresh
+              </button>
+            </div>
+            <div className="risk-grid" style={{ marginBottom: '1rem' }}>
+              {[
+                ['Rows', simData?.count ?? 0],
+                ['Trade Candidates', simData?.summary?.trade_candidates ?? 0],
+                ['No-trade Cycles', simData?.summary?.no_trade_cycles ?? 0],
+                ['Avg Confidence', `${((simData?.summary?.avg_confidence ?? 0) * 100).toFixed(1)}%`],
+              ].map(([k, v]) => (
+                <div key={k} className="risk-row"><span className="risk-key">{k}</span><span className="risk-val">{v}</span></div>
+              ))}
+            </div>
+            {simData?.data?.length ? (
+              <div className="signal-trace">
+                {simData.data.slice(0, 25).map((row, i) => (
+                  <div key={i} className={`signal-row ${row.signal === 'no_trade' ? 'no-trade' : 'trade'}`}>
+                    <span className="signal-time">{row.time ? new Date(row.time).toLocaleTimeString() : '—'}</span>
+                    <span className={`signal-badge ${row.signal === 'no_trade' ? '' : 'trade-badge-active'}`}>
+                      {row.signal === 'no_trade' ? 'SKIP' : row.signal?.action || 'TRADE'}
+                    </span>
+                    <span className="signal-reason">{row.reason || row.trend || '—'}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty-text">No simulation rows yet. Start Simulation mode from Web Control Center.</p>
+            )}
           </div>
         )}
 
