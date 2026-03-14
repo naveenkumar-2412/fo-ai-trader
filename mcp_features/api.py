@@ -5,10 +5,12 @@ import pandas as pd
 import numpy as np
 import ta
 import requests
+from feature_store.store import save_features, get_latest_features
 
 app = FastAPI(title="Feature Engine MCP", version="2.1.0")
 
 MARKET_DATA_URL = "http://localhost:8001"
+NEWS_URL = "http://localhost:8008"
 
 class CandleData(BaseModel):
     data: List[Dict[str, Any]]
@@ -212,6 +214,22 @@ def generate_features(payload: CandleData):
             oi_change_pct = float(np.random.uniform(-5, 5))
             pcr           = float(np.random.uniform(0.8, 1.2))
 
+        # ── Live News summary (real-time sentiment + impact) ──────────────────
+        news_headline_count = 0
+        news_sentiment = 0.0
+        news_impact = 0.0
+        news_high_impact = 0
+        try:
+            nr = requests.get(f"{NEWS_URL}/summary", params={"symbol": payload.symbol, "lookback_minutes": 15}, timeout=2)
+            if nr.status_code == 200:
+                news = nr.json().get("data", {})
+                news_headline_count = int(news.get("headline_count", 0))
+                news_sentiment = float(news.get("avg_sentiment", 0.0))
+                news_impact = float(news.get("avg_impact", 0.0))
+                news_high_impact = int(news.get("high_impact_news", 0))
+        except Exception:
+            pass
+
         # ── Build feature vector ───────────────────────────────────────────────
         feature_vector = {
             "return_1":        float(latest.get("return_1", 0)),
@@ -244,11 +262,29 @@ def generate_features(payload: CandleData):
             "minutes_since_open": minutes_since_open,
             "oi_change_pct":   oi_change_pct,
             "pcr":             pcr,
+            "news_headline_count_15m": news_headline_count,
+            "news_sentiment": news_sentiment,
+            "news_impact_score": news_impact,
+            "news_high_impact": news_high_impact,
             **patterns,
             **gaps,
         }
 
+        try:
+            save_features(payload.symbol, feature_vector)
+        except Exception:
+            pass
+
         return {"status": "success", "features": feature_vector}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/latest_features")
+def latest_features(symbol: str = "NIFTY", limit: int = 1):
+    try:
+        data = get_latest_features(symbol=symbol, limit=limit)
+        return {"status": "success", "count": len(data), "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

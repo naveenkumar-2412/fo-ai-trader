@@ -85,12 +85,21 @@ def generate_signal(payload: PredictionData):
         bb_pos    = float(features.get("bb_position", 0.5))
         supertrend= float(features.get("supertrend", 0))
         obv_slope = float(features.get("obv_slope", 0))
+        news_high_impact = int(features.get("news_high_impact", 0))
+        news_impact_score = float(features.get("news_impact_score", 0.0))
 
         features["confidence"] = conf  # for logging
 
         # ── Rule 1: Confidence ────────────────────────────────────────────────
         if conf <= 0.65:
             return _no_trade("Low confidence (< 65%)", features)
+
+        # ── Rule 1b: High-impact news risk gate ──────────────────────────────
+        if news_high_impact == 1 and conf < 0.75:
+            return _no_trade(
+                f"High-impact news window (impact={news_impact_score:.2f}), confidence too low",
+                features,
+            )
 
         # ── Rule 2: ADX strength ──────────────────────────────────────────────
         if trend in ("bullish", "bearish") and adx < 20:

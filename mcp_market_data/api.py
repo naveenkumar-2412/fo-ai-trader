@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import time
 import math
 import yfinance as yf
+import os
 from typing import Optional
 
 app = FastAPI(title="Market Data MCP", version="2.0.0")
@@ -20,18 +21,23 @@ LOT_SIZES = {"NIFTY": 50, "BANKNIFTY": 15, "FINIFTY": 40}
 
 # ─── Simple In-Memory Cache ────────────────────────────────────────────────────
 _cache: dict = {}
-CACHE_TTL = 60  # seconds
+_last_live_fetch_ts: Optional[float] = None
+
+ALLOW_MOCK_DATA = os.getenv("ALLOW_MOCK_DATA", "false").strip().lower() == "true"
+CANDLE_CACHE_TTL = int(os.getenv("CANDLE_CACHE_TTL", "20"))
+QUOTE_CACHE_TTL = int(os.getenv("QUOTE_CACHE_TTL", "3"))
+OPTION_CHAIN_CACHE_TTL = int(os.getenv("OPTION_CHAIN_CACHE_TTL", "15"))
 
 
 def _cache_get(key: str):
     entry = _cache.get(key)
-    if entry and (time.time() - entry["ts"]) < CACHE_TTL:
+    if entry and (time.time() - entry["ts"]) < entry.get("ttl", CANDLE_CACHE_TTL):
         return entry["data"]
     return None
 
 
-def _cache_set(key: str, data):
-    _cache[key] = {"data": data, "ts": time.time()}
+def _cache_set(key: str, data, ttl: int):
+    _cache[key] = {"data": data, "ts": time.time(), "ttl": ttl}
 
 
 # ─── Fallback Mock ─────────────────────────────────────────────────────────────
@@ -49,6 +55,8 @@ def generate_mock_candles(symbol: str, minutes: int = 100):
 
 
 def fetch_live_candles(symbol: str, timeframe: str = "1m", period: str = "1d"):
+    global _last_live_fetch_ts
+
     cache_key = f"candles:{symbol}:{timeframe}"
     cached = _cache_get(cache_key)
     if cached:
@@ -58,7 +66,11 @@ def fetch_live_candles(symbol: str, timeframe: str = "1m", period: str = "1d"):
     try:
         data = yf.download(yf_ticker, period=period, interval=timeframe, progress=False)
         if data.empty:
-            return generate_mock_candles(symbol, 100)
+            if ALLOW_MOCK_DATA:
+                mock_data = generate_mock_candles(symbol, 100)
+                _cache_set(cache_key, mock_data, CANDLE_CACHE_TTL)
+                return mock_data
+            raise RuntimeError(f"No live candle data available for {symbol}")
 
         df = data.reset_index()
         df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in df.columns]
@@ -67,11 +79,16 @@ def fetch_live_candles(symbol: str, timeframe: str = "1m", period: str = "1d"):
         df = df[["timestamp", "open", "high", "low", "close", "volume"]]
         df["timestamp"] = df["timestamp"].astype(str)
         result = df.to_dict(orient="records")
-        _cache_set(cache_key, result)
+        _last_live_fetch_ts = time.time()
+        _cache_set(cache_key, result, CANDLE_CACHE_TTL)
         return result
     except Exception as e:
         print(f"yfinance fetch failed ({symbol}): {e}")
-        return generate_mock_candles(symbol, 100)
+        if ALLOW_MOCK_DATA:
+            mock_data = generate_mock_candles(symbol, 100)
+            _cache_set(cache_key, mock_data, CANDLE_CACHE_TTL)
+            return mock_data
+        raise
 
 
 def get_spot_price(symbol: str) -> float:
@@ -83,7 +100,7 @@ def get_spot_price(symbol: str) -> float:
 
     candles = fetch_live_candles(symbol)
     price = float(candles[-1]["close"]) if candles else 22000.0
-    _cache_set(cache_key, price)
+    _cache_set(cache_key, price, QUOTE_CACHE_TTL)
     return price
 
 
@@ -187,10 +204,24 @@ def get_option_chain(symbol: str = "NIFTY"):
         atr_pct = float(np.std(np.diff(closes)) / np.mean(closes) * 100) if len(closes) > 2 else 0.7
 
         chain = build_option_chain(symbol, spot, atr_pct)
-        _cache_set(cache_key, chain)
+        _cache_set(cache_key, chain, OPTION_CHAIN_CACHE_TTL)
         return {"status": "success", "symbol": symbol, "data": chain}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+def health():
+    now = time.time()
+    age = None if _last_live_fetch_ts is None else round(now - _last_live_fetch_ts, 2)
+    return {
+        "status": "success",
+        "data": {
+            "allow_mock_data": ALLOW_MOCK_DATA,
+            "last_live_fetch_age_sec": age,
+            "cache_items": len(_cache),
+        },
+    }
 
 
 @app.get("/oi_data")
