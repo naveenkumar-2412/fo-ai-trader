@@ -1,43 +1,52 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import date
 import math
 
-app = FastAPI(title="Risk Manager MCP", version="2.0.0")
+app = FastAPI(title="Risk Manager MCP", version="2.1.0")
 
-# ─── Daily state reset per calendar day ────────────────────────────────────
-_today = date.today()
-daily_state = {
-    "date": str(_today),
-    "total_trades": 0,
-    "winning_trades": 0,
-    "losing_trades": 0,
-    "consecutive_losses": 0,
-    "daily_pnl": 0.0,
-    "daily_pnl_pct": 0.0,
-    "capital": 500000,          # Starting capital: 5L
-    "max_trades": 8,
-    "max_daily_loss_pct": -3.0, # Max 3% daily loss cap
-    "max_consec_losses": 3,
-    "max_exposure_pct": 30.0,   # Max 30% capital exposed at any time
-    "current_exposure": 0.0,
+# ─── Per-instrument config ─────────────────────────────────────────────────────
+INSTRUMENT_CONFIG = {
+    "NIFTY":     {"lot_size": 50,  "span_margin":  90_000, "exposure_margin": 15_000},
+    "BANKNIFTY": {"lot_size": 15,  "span_margin": 130_000, "exposure_margin": 20_000},
+    "FINIFTY":   {"lot_size": 40,  "span_margin":  60_000, "exposure_margin": 10_000},
+    "DEFAULT":   {"lot_size": 50,  "span_margin": 100_000, "exposure_margin": 15_000},
 }
 
+# ─── Daily state (auto-resets per calendar day) ────────────────────────────────
+_today = str(date.today())
+daily_state = {
+    "date":               _today,
+    "total_trades":       0,
+    "winning_trades":     0,
+    "losing_trades":      0,
+    "consecutive_losses": 0,
+    "daily_pnl":          0.0,
+    "daily_pnl_pct":      0.0,
+    "capital":            500_000,   # Starting: 5 Lakhs
+    "peak_capital":       500_000,
+    "current_exposure":   0.0,
+    # Guardrails
+    "max_trades":         8,
+    "max_daily_loss_pct": -3.0,
+    "max_consec_losses":  3,
+    "max_exposure_pct":   30.0,
+}
+
+
 def _auto_reset():
-    """Reset daily counters if a new trading day begins."""
     global daily_state
     today = str(date.today())
     if daily_state["date"] != today:
         daily_state.update({
-            "date": today,
-            "total_trades": 0,
-            "winning_trades": 0,
-            "losing_trades": 0,
+            "date":               today,
+            "total_trades":       0,
+            "winning_trades":     0,
+            "losing_trades":      0,
             "consecutive_losses": 0,
-            "daily_pnl": 0.0,
-            "daily_pnl_pct": 0.0,
-            "max_trades": 8,
-            "current_exposure": 0.0,
+            "daily_pnl":          0.0,
+            "daily_pnl_pct":      0.0,
+            "current_exposure":   0.0,   # ← full reset on new day
         })
 
 
@@ -47,41 +56,55 @@ class TradeResult(BaseModel):
 
 
 class SignalValidate(BaseModel):
-    action: str
-    sl_pct: float
-    atr_pct: float = 0.7        # From feature engine
+    action:  str
+    sl_pct:  float
+    atr_pct: float = Field(default=0.7, description="From the strategy signal")
 
 
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+def _instrument_from_action(action: str) -> str:
+    if "BANK" in action: return "BANKNIFTY"
+    if "FIN"  in action: return "FINIFTY"
+    return "NIFTY"
+
+
+def _kelly_fraction(p: float) -> float:
+    """Fractional Kelly (25% of full Kelly, clamped to 0–25%)."""
+    q = 1 - p
+    b = 1.5   # avg win / avg loss ratio assumption
+    kelly = max(0.0, (p * b - q) / b)
+    return min(kelly * 0.25, 0.25)
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/check_allowed")
 def check_trading_allowed():
     _auto_reset()
-    allowed = True
-    reason = None
+    allowed, reason = True, None
+    cap = daily_state["capital"]
 
     if daily_state["total_trades"] >= daily_state["max_trades"]:
-        allowed = False
-        reason = f"Max trades limit reached ({daily_state['max_trades']} trades)."
+        allowed, reason = False, f"Max {daily_state['max_trades']} trades/day reached"
 
-    if daily_state["consecutive_losses"] >= daily_state["max_consec_losses"]:
-        allowed = False
-        reason = f"Hit {daily_state['max_consec_losses']} consecutive losses — cooling down."
+    elif daily_state["consecutive_losses"] >= daily_state["max_consec_losses"]:
+        allowed, reason = False, f"{daily_state['max_consec_losses']} consecutive losses — cooling down"
 
-    if daily_state["daily_pnl_pct"] <= daily_state["max_daily_loss_pct"]:
-        allowed = False
-        reason = f"Daily loss limit breached ({daily_state['daily_pnl_pct']:.2f}%)."
+    elif daily_state["daily_pnl_pct"] <= daily_state["max_daily_loss_pct"]:
+        allowed, reason = False, f"Daily loss limit ({daily_state['daily_pnl_pct']:.2f}%) breached"
 
-    exposure_used_pct = (daily_state["current_exposure"] / daily_state["capital"]) * 100
-    if exposure_used_pct >= daily_state["max_exposure_pct"]:
-        allowed = False
-        reason = f"Max capital exposure ({exposure_used_pct:.1f}%) reached."
+    else:
+        used_pct = (daily_state["current_exposure"] / cap) * 100 if cap > 0 else 0
+        if used_pct >= daily_state["max_exposure_pct"]:
+            allowed, reason = False, f"Exposure limit ({used_pct:.1f}%) reached"
 
     return {
         "allowed": allowed,
-        "reason": reason,
-        "daily_state": {
-            "trades": daily_state["total_trades"],
-            "daily_pnl_pct": round(daily_state["daily_pnl_pct"], 3),
-            "exposure_pct": round(exposure_used_pct, 2),
+        "reason":  reason,
+        "snapshot": {
+            "trades_today":       daily_state["total_trades"],
+            "trades_left":        daily_state["max_trades"] - daily_state["total_trades"],
+            "daily_pnl_pct":      round(daily_state["daily_pnl_pct"], 3),
+            "exposure_pct":       round((daily_state["current_exposure"] / daily_state["capital"]) * 100, 2) if daily_state["capital"] > 0 else 0,
             "consecutive_losses": daily_state["consecutive_losses"],
         }
     }
@@ -89,72 +112,60 @@ def check_trading_allowed():
 
 @app.post("/calculate_quantity")
 def calculate_quantity(payload: SignalValidate):
-    """
-    Kelly Criterion-based position sizing with margin guard.
-
-    Kelly f* = (p * b - q) / b
-        p = historical win_rate (default 0.60 if no trades yet)
-        q = 1 - p
-        b = average win / average loss ratio (default 1.5)
-
-    We use fractional Kelly (25% of full Kelly) to reduce variance.
-    """
     _auto_reset()
-    is_selling = "SELL" in payload.action
-    capital = daily_state["capital"]
+    is_sell   = "SELL" in payload.action or "CONDOR" in payload.action
+    capital   = daily_state["capital"]
+    atr_pct   = max(0.1, payload.atr_pct)
 
-    # ── Kelly sizing ────────────────────────────────────────────────────────
+    # Instrument lookup
+    instr = _instrument_from_action(payload.action)
+    cfg   = INSTRUMENT_CONFIG.get(instr, INSTRUMENT_CONFIG["DEFAULT"])
+    lot_size = cfg["lot_size"]
+    span     = cfg["span_margin"]
+
+    # Kelly-based risk money
     total = daily_state["total_trades"]
-    wins = daily_state["winning_trades"]
-    p = (wins / total) if total >= 5 else 0.60   # Fall back to 60% prior
-    q = 1 - p
-    b = 1.5  # Reward/Risk ratio baseline
+    wins  = daily_state["winning_trades"]
+    p     = (wins / total) if total >= 5 else 0.60
+    frac  = _kelly_fraction(p)
+    risk_cash = capital * frac
 
-    kelly_f = (p * b - q) / b
-    kelly_f = max(0.0, min(kelly_f, 0.25))  # Clamp 0–25%
-    fractional_kelly = kelly_f * 0.25        # Use 25% of full Kelly
+    # ATR-adjusted ATM premium estimate
+    spot_map = {"NIFTY": 22500, "BANKNIFTY": 48000, "FINIFTY": 23000}
+    spot_approx = spot_map.get(instr, 22500)
+    premium = max(40.0, (atr_pct / 100) * spot_approx * 2.0)
 
-    risk_amount = capital * fractional_kelly
+    risk_per_lot = premium * payload.sl_pct * lot_size
+    lots_by_risk = max(1, int(risk_cash // risk_per_lot)) if risk_per_lot > 0 else 1
 
-    # ── ATR-adjusted premium estimate ──────────────────────────────────────
-    # Approx. ATM premium ~ 2x ATR of the underlying (rough heuristic)
-    atr_pct = payload.atr_pct
-    spot_approx = 22500  # approx NIFTY spot
-    premium = max(40, (atr_pct / 100) * spot_approx * 2.0)
-
-    risk_per_unit = premium * payload.sl_pct
-    lot_size = 50
-    risk_per_lot = risk_per_unit * lot_size
-
-    lots_by_risk = max(1, int(risk_amount // risk_per_lot)) if risk_per_lot > 0 else 1
-
-    # ── Margin guard for selling ────────────────────────────────────────────
-    if is_selling:
-        margin_per_lot = 130000 if "STRANGLE" in payload.action else 105000
-        max_lots_by_margin = max(0, int((capital * 0.30 - daily_state["current_exposure"]) // margin_per_lot))
-        if max_lots_by_margin == 0:
-            return {"quantity": 0, "risk_amount": 0, "reason": "Insufficient free margin for option selling"}
-        lots = min(lots_by_risk, max_lots_by_margin)
-        exposure = lots * margin_per_lot
+    # Margin/exposure guard
+    if is_sell:
+        free_margin = capital * (daily_state["max_exposure_pct"] / 100) - daily_state["current_exposure"]
+        max_lots_margin = max(0, int(free_margin // span))
+        if max_lots_margin == 0:
+            return {"quantity": 0, "lots": 0, "risk_amount": 0,
+                    "reason": f"Insufficient free margin for {instr} selling"}
+        lots = min(lots_by_risk, max_lots_margin)
+        exposure = lots * span
     else:
-        # Buying: exposure is only the premium paid
-        max_lots_by_exposure = max(1, int((capital * 0.10) // (premium * lot_size)))
-        lots = min(lots_by_risk, max_lots_by_exposure)
+        # Buying: exposure = premium paid
+        max_lots_buy = max(1, int((capital * 0.10) // (premium * lot_size)))
+        lots = min(lots_by_risk, max_lots_buy)
         exposure = lots * premium * lot_size
 
     qty = lots * lot_size
     actual_risk = lots * risk_per_lot
 
-    # Track exposure
     daily_state["current_exposure"] += exposure
 
     return {
-        "quantity": qty,
-        "lots": lots,
-        "risk_amount": round(actual_risk, 2),
+        "quantity":       qty,
+        "lots":           lots,
+        "risk_amount":    round(actual_risk, 2),
         "exposure_added": round(exposure, 2),
-        "kelly_fraction": round(fractional_kelly, 4),
-        "estimated_premium": round(premium, 2),
+        "kelly_fraction": round(frac, 4),
+        "premium_est":    round(premium, 2),
+        "instrument":     instr,
     }
 
 
@@ -162,22 +173,51 @@ def calculate_quantity(payload: SignalValidate):
 def update_pnl(payload: TradeResult):
     _auto_reset()
     pnl = payload.pnl
+    cap = daily_state["capital"]
 
     daily_state["total_trades"] += 1
-    daily_state["daily_pnl"] += pnl
-    daily_state["daily_pnl_pct"] += (pnl / daily_state["capital"]) * 100
+    daily_state["daily_pnl"]    += pnl
+    daily_state["daily_pnl_pct"]+= (pnl / cap) * 100 if cap > 0 else 0
     daily_state["current_exposure"] = max(0.0, daily_state["current_exposure"] - payload.exposure_released)
-
-    if pnl > 0:
-        daily_state["winning_trades"] += 1
-        daily_state["consecutive_losses"] = 0
-    else:
-        daily_state["losing_trades"] += 1
-        daily_state["consecutive_losses"] += 1
-
     daily_state["capital"] += pnl
 
+    if daily_state["capital"] > daily_state["peak_capital"]:
+        daily_state["peak_capital"] = daily_state["capital"]
+
+    if pnl > 0:
+        daily_state["winning_trades"]     += 1
+        daily_state["consecutive_losses"] = 0
+    else:
+        daily_state["losing_trades"]      += 1
+        daily_state["consecutive_losses"] += 1
+
     return {"status": "success", "daily_state": daily_state}
+
+
+@app.get("/summary")
+def get_summary():
+    """Dashboard-friendly summary of the risk manager state."""
+    _auto_reset()
+    cap = daily_state["capital"]
+    peak = daily_state["peak_capital"]
+    total = daily_state["total_trades"]
+    wins  = daily_state["winning_trades"]
+    drawdown = ((peak - cap) / peak * 100) if peak > 0 else 0.0
+
+    return {
+        "status": "success",
+        "data": {
+            "capital":            round(cap, 2),
+            "daily_pnl":          round(daily_state["daily_pnl"], 2),
+            "daily_pnl_pct":      round(daily_state["daily_pnl_pct"], 3),
+            "win_rate":           round((wins / total * 100) if total > 0 else 0, 2),
+            "trades_today":       total,
+            "trades_left":        daily_state["max_trades"] - total,
+            "consecutive_losses": daily_state["consecutive_losses"],
+            "exposure_pct":       round((daily_state["current_exposure"] / cap) * 100 if cap > 0 else 0, 2),
+            "current_drawdown_pct": round(drawdown, 2),
+        }
+    }
 
 
 @app.get("/status")

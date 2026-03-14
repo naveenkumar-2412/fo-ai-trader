@@ -568,3 +568,57 @@ h1, h2, h3, h4 {
   text-align: center;
 }
 .empty-trade-state .sub-text { font-size: 0.8rem; opacity: 0.7; }
+
+/* -- Symbol Switcher -- */
+.symbol-switcher { display: flex; gap: 0.4rem; margin-bottom: 2rem; }
+.sym-btn {
+  flex: 1; padding: 0.4rem 0.2rem; border-radius: 8px; border: 1px solid var(--border-color);
+  background: transparent; color: var(--text-muted); font-size: 0.78rem; font-weight: 600;
+  cursor: pointer; transition: all 0.2s;
+}
+.sym-btn:hover { background: rgba(255,255,255,0.05); color: var(--text-main); }
+.sym-btn.active { background: rgba(59,130,246,0.15); color: var(--primary-accent); border-color: var(--primary-accent); }
+
+/* -- Twin grid (equity + risk) -- */
+.twin-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
+
+/* -- Equity Curve -- */
+.equity-chart-wrapper { display: flex; flex-direction: column; gap: 0.5rem; }
+.equity-header { display: flex; justify-content: space-between; align-items: center; }
+.equity-label { font-size: 0.875rem; color: var(--text-muted); }
+.equity-return { font-weight: 700; font-size: 1rem; }
+.equity-svg { border-radius: 8px; }
+.equity-empty { color: var(--text-muted); font-size: 0.875rem; padding: 1.5rem 0; text-align: center; }
+
+/* -- Risk Status Widget -- */
+.risk-panel { display: flex; flex-direction: column; gap: 0.5rem; }
+.panel-title { font-size: 1rem; font-weight: 600; margin-bottom: 0.75rem; display: flex; align-items: center; gap: 6px; }
+.risk-grid { display: flex; flex-direction: column; gap: 0.5rem; }
+.risk-row { display: flex; justify-content: space-between; padding: 0.5rem; background: rgba(0,0,0,0.1); border-radius: 6px; font-size: 0.875rem; }
+.risk-key { color: var(--text-muted); }
+.risk-val { font-weight: 600; }
+
+/* -- Feature Importance -- */
+.feat-list { display: flex; flex-direction: column; gap: 0.6rem; }
+.feat-row { display: flex; align-items: center; gap: 0.75rem; font-size: 0.85rem; }
+.feat-name { width: 120px; color: var(--text-muted); flex-shrink: 0; }
+.feat-bar-track { flex: 1; height: 8px; background: rgba(255,255,255,0.07); border-radius: 4px; overflow: hidden; }
+.feat-bar-fill { height: 100%; border-radius: 4px; background: linear-gradient(90deg, #3b82f6, #8b5cf6); transition: width 0.5s ease; }
+.feat-score { width: 60px; text-align: right; color: var(--text-muted); font-size: 0.75rem; }
+
+/* -- Signal Trace -- */
+.signal-trace { display: flex; flex-direction: column; gap: 0.4rem; max-height: 500px; overflow-y: auto; }
+.signal-row { display: grid; grid-template-columns: 90px 120px 1fr; align-items: center; gap: 0.75rem; padding: 0.6rem; border-radius: 8px; font-size: 0.85rem; }
+.signal-row.no-trade { background: rgba(239,68,68,0.04); border-left: 2px solid rgba(239,68,68,0.2); }
+.signal-row.trade    { background: rgba(16,185,129,0.07); border-left: 2px solid rgba(16,185,129,0.3); }
+.signal-time { color: var(--text-muted); font-size: 0.78rem; }
+.signal-badge { padding: 3px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; background: rgba(255,255,255,0.07); text-align: center; }
+.signal-badge.trade-badge-active { background: rgba(16,185,129,0.15); color: var(--success); }
+.signal-reason { color: var(--text-muted); font-size: 0.8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* -- Badge variants -- */
+.badge-bull { border-color: rgba(16,185,129,0.4); color: var(--success); }
+.badge-bear { border-color: rgba(239,68,68,0.4); color: var(--danger); }
+
+/* -- Empty text -- */
+.empty-text { color: var(--text-muted); font-size: 0.875rem; text-align: center; padding: 2rem; }

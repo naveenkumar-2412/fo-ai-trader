@@ -2,88 +2,155 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import os
-from typing import Dict, Any
+import requests
+from datetime import datetime
 
-app = FastAPI(title="Dashboard API Gateway", version="1.0.0")
+app = FastAPI(title="Dashboard API Gateway", version="2.0.0")
 
-# Allow requests from the React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with the specific frontend origin e.g. "http://localhost:5173"
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-LIVE_STATE_FILE = "../live_state.json"
-TRADE_LOG_FILE = "../trade_log.jsonl"
+# ─── Paths ───────────────────────────────────────────────────────────────────
+LIVE_STATE   = "../live_state.json"
+TRADE_LOG    = "../trade_log.jsonl"
+SIGNAL_LOG   = "../signal_log.jsonl"
+PREDICTION_URL = "http://localhost:8003"
+RISK_URL       = "http://localhost:8005"
 
-@app.get("/api/state")
-def get_live_state():
-    """Returns the current live state of the orchestrator."""
-    if not os.path.exists(LIVE_STATE_FILE):
-        return {"status": "waiting", "message": "Orchestrator hasn't started yet."}
-    
+
+def _read_jsonl(path: str, limit: int = 100) -> list:
+    if not os.path.exists(path):
+        return []
+    lines = []
     try:
-        with open(LIVE_STATE_FILE, "r") as f:
-            state = json.load(f)
-        return {"status": "success", "data": state}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading live state: {str(e)}")
-
-@app.get("/api/metrics")
-def get_metrics():
-    """Calculates overall metrics from the trade log."""
-    trades = []
-    if os.path.exists(TRADE_LOG_FILE):
-        with open(TRADE_LOG_FILE, "r") as f:
+        with open(path) as f:
             for line in f:
                 try:
-                    data = json.loads(line.strip())
-                    trades.append(data["order"])
-                except:
+                    lines.append(json.loads(line.strip()))
+                except Exception:
                     pass
+    except Exception:
+        pass
+    return lines[-limit:]
 
-    total_trades = len(trades)
-    if total_trades == 0:
-        return {"status": "success", "data": {"win_rate": 0, "profit_factor": 0, "max_drawdown": 0, "total_pnl": 0}}
 
-    winning_trades = [t for t in trades if t.get("pnl", 0) > 0]
-    losing_trades = [t for t in trades if t.get("pnl", 0) <= 0]
-    
-    win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0
-    
-    gross_profit = sum(t.get("pnl", 0) for t in winning_trades)
-    gross_loss = abs(sum(t.get("pnl", 0) for t in losing_trades))
-    
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0)
-    
-    total_pnl = sum(t.get("pnl", 0) for t in trades)
-    
-    # Rough simulated max drawdown based on completed trades
-    max_drawdown = 0
-    peak = 0
-    current_balance = 1000000 # Assume starting capital of 10L
-    
-    for t in trades:
-        current_balance += t.get("pnl", 0)
-        if current_balance > peak:
-            peak = current_balance
-        
-        drawdown = (peak - current_balance) / peak if peak > 0 else 0
-        if drawdown > max_drawdown:
-            max_drawdown = drawdown
+# ─── /api/state ───────────────────────────────────────────────────────────────
+@app.get("/api/state")
+def get_live_state():
+    try:
+        if os.path.exists(LIVE_STATE):
+            with open(LIVE_STATE) as f:
+                data = json.load(f)
+        else:
+            data = {"is_live": False, "current_price": None, "active_trade": None, "prediction": None}
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── /api/metrics ─────────────────────────────────────────────────────────────
+@app.get("/api/metrics")
+def get_metrics():
+    trades = _read_jsonl(TRADE_LOG)
+    closed = [t for t in trades if "pnl" in t.get("order", {})]
+    if not closed:
+        return {"total_trades": 0, "win_rate": 0, "profit_factor": 0,
+                "net_pnl": 0, "max_drawdown": 0, "recent_trades": []}
+
+    pnls   = [t["order"]["pnl"] for t in closed]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    pf     = (sum(wins) / abs(sum(losses))) if losses else float("inf")
+
+    # Drawdown
+    capital = 500_000
+    peak    = capital
+    max_dd  = 0.0
+    for p in pnls:
+        capital += p
+        peak    = max(peak, capital)
+        dd      = (peak - capital) / peak * 100
+        max_dd  = max(max_dd, dd)
+
+    recent = [
+        {"time": t.get("time", ""),
+         "action": t["order"].get("action", ""),
+         "pnl": t["order"].get("pnl", 0),
+         "status": "CLOSED"}
+        for t in closed[-10:]
+    ]
 
     return {
-        "status": "success", 
-        "data": {
-            "win_rate": round(win_rate * 100, 2),
-            "profit_factor": round(profit_factor, 2),
-            "max_drawdown": round(max_drawdown * 100, 2),
-            "total_pnl": round(total_pnl, 2),
-            "trades": trades[-10:] # Return last 10 trades for the table
-        }
+        "total_trades":  len(closed),
+        "win_rate":      round(len(wins) / len(closed) * 100, 1),
+        "profit_factor": round(pf, 2),
+        "net_pnl":       round(sum(pnls), 2),
+        "max_drawdown":  round(max_dd, 2),
+        "recent_trades": list(reversed(recent)),
     }
+
+
+# ─── /api/equity_curve ────────────────────────────────────────────────────────
+@app.get("/api/equity_curve")
+def get_equity_curve():
+    trades = _read_jsonl(TRADE_LOG, limit=500)
+    closed = [t for t in trades if "pnl" in t.get("order", {})]
+    if not closed:
+        return {"data": [{"time": datetime.now().isoformat(), "capital": 500000}]}
+
+    capital = 500_000.0
+    curve   = []
+    for t in closed:
+        capital += t["order"]["pnl"]
+        curve.append({
+            "time":    t.get("time", ""),
+            "capital": round(capital, 2),
+            "pnl":     t["order"]["pnl"],
+            "action":  t["order"].get("action", ""),
+        })
+    return {"data": curve}
+
+
+# ─── /api/signals ─────────────────────────────────────────────────────────────
+@app.get("/api/signals")
+def get_signals(limit: int = 20):
+    signals = _read_jsonl(SIGNAL_LOG, limit=limit)
+    return {"data": list(reversed(signals))}
+
+
+# ─── /api/feature_importance ──────────────────────────────────────────────────
+@app.get("/api/feature_importance")
+def get_feature_importance():
+    try:
+        r = requests.get(f"{PREDICTION_URL}/feature_importance", timeout=3)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    # Fallback mocked importances
+    mock = {
+        "adx": 9800, "rsi": 8500, "vwap_dist": 7200, "macd_diff": 6900,
+        "atr_pct": 6400, "bb_position": 5800, "volume_ratio": 5200,
+        "ema_cross": 4900, "obv_slope": 4400, "pcr": 4100,
+    }
+    return {"status": "success", "data": mock}
+
+
+# ─── /api/risk_status ─────────────────────────────────────────────────────────
+@app.get("/api/risk_status")
+def get_risk_status():
+    try:
+        r = requests.get(f"{RISK_URL}/summary", timeout=3)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {"status": "offline", "data": {}}
+
 
 if __name__ == "__main__":
     import uvicorn
