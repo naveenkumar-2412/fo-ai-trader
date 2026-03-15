@@ -249,6 +249,26 @@ def get_oi_data(symbol: str = "NIFTY"):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+@app.get("/multi_timeframe")
+def get_multi_timeframe(symbol: str = "NIFTY"):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    timeframes = {"1m": "1m", "5m": "5m", "15m": "15m"}
+    results = {}
+    def _fetch(label, tf):
+        try:
+            candles = fetch_live_candles(symbol, timeframe=tf)
+            return label, {"status": "ok", "count": len(candles), "data": candles}
+        except Exception as e:
+            return label, {"status": "error", "error": str(e), "data": []}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_fetch, label, tf): label for label, tf in timeframes.items()}
+        for future in as_completed(futures):
+            label, data = future.result()
+            results[label] = data
+    spot = get_spot_price(symbol)
+    return {"status": "success", "symbol": symbol, "spot": spot, "candles": results}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)

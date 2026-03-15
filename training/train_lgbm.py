@@ -1,217 +1,171 @@
-import lightgbm as lgb
-import pandas as pd
-import numpy as np
-import joblib
+"""
+Incremental model retraining script.
+Usage:
+  python training/train_lgbm.py            # trains on synthetic data only
+  python training/train_lgbm.py --retrain  # appends real trade log data and retrains
+"""
+import argparse
 import os
+import shutil
+import json
+import numpy as np
+import pandas as pd
+import joblib
+from datetime import datetime
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import classification_report, accuracy_score
+from lightgbm import LGBMClassifier
 
-print("Starting LightGBM Training Process (v2)...")
+parser = argparse.ArgumentParser()
+parser.add_argument("--retrain", action="store_true", help="Append real trade log to synthetic data")
+parser.add_argument("--capital", type=float, default=500_000)
+args = parser.parse_args()
 
-# ─── 1. Generate Richer Simulated Historical Data ──────────────────────────
-n_samples = 20000
-np.random.seed(42)
-
-# ── Simulated market state variables ──────────────────────────────────────
-spot = 22000
-spot_series = [spot]
-for _ in range(n_samples - 1):
-    spot_series.append(spot_series[-1] * (1 + np.random.normal(0, 0.001)))
-
-spot_arr = np.array(spot_series)
-close = spot_arr
-high = close + np.random.uniform(5, 50, n_samples)
-low = close - np.random.uniform(5, 50, n_samples)
-volume = np.random.randint(5000, 100000, n_samples)
-
-# ── Compute real indicator values from synthetic OHLCV ─────────────────────
-import ta
-
-df_raw = pd.DataFrame({"open": close * 0.999, "high": high, "low": low, "close": close, "volume": volume.astype(float)})
-
-# Returns
-df_raw['return_1'] = df_raw['close'].pct_change(1)
-df_raw['return_3'] = df_raw['close'].pct_change(3)
-df_raw['return_5'] = df_raw['close'].pct_change(5)
-df_raw['body_size'] = abs(df_raw['close'] - df_raw['open']) / (df_raw['open'] + 1e-9) * 100
-df_raw['hl_range'] = (df_raw['high'] - df_raw['low']) / (df_raw['low'] + 1e-9) * 100
-df_raw['upper_wick'] = (df_raw['high'] - df_raw[['open', 'close']].max(axis=1)) / (df_raw['close'] + 1e-9) * 100
-df_raw['lower_wick'] = (df_raw[['open', 'close']].min(axis=1) - df_raw['low']) / (df_raw['close'] + 1e-9) * 100
-
-# Momentum
-df_raw['rsi'] = ta.momentum.RSIIndicator(close=df_raw['close'], window=14).rsi()
-df_raw['stoch_k'] = ta.momentum.StochasticOscillator(high=df_raw['high'], low=df_raw['low'], close=df_raw['close'], window=14).stoch()
-df_raw['williams_r'] = ta.momentum.WilliamsRIndicator(high=df_raw['high'], low=df_raw['low'], close=df_raw['close'], lbp=14).williams_r()
-
-# Trend
-macd = ta.trend.MACD(close=df_raw['close'])
-df_raw['macd'] = macd.macd()
-df_raw['macd_diff'] = macd.macd_diff()
-df_raw['ema9'] = ta.trend.EMAIndicator(close=df_raw['close'], window=9).ema_indicator()
-df_raw['ema21'] = ta.trend.EMAIndicator(close=df_raw['close'], window=21).ema_indicator()
-df_raw['ema_cross'] = (df_raw['ema9'] - df_raw['ema21']) / (df_raw['ema21'] + 1e-9) * 100
-adx = ta.trend.ADXIndicator(high=df_raw['high'], low=df_raw['low'], close=df_raw['close'], window=14)
-df_raw['adx'] = adx.adx()
-df_raw['adx_pos'] = adx.adx_pos()
-df_raw['adx_neg'] = adx.adx_neg()
-
-# Volatility
-df_raw['atr'] = ta.volatility.AverageTrueRange(high=df_raw['high'], low=df_raw['low'], close=df_raw['close'], window=14).average_true_range()
-df_raw['atr_pct'] = df_raw['atr'] / (df_raw['close'] + 1e-9) * 100
-bb = ta.volatility.BollingerBands(close=df_raw['close'], window=20, window_dev=2)
-df_raw['bb_width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / (bb.bollinger_mavg() + 1e-9) * 100
-df_raw['bb_position'] = (df_raw['close'] - bb.bollinger_lband()) / (bb.bollinger_hband() - bb.bollinger_lband() + 1e-9)
-
-# Volume
-df_raw['obv'] = ta.volume.OnBalanceVolumeIndicator(close=df_raw['close'], volume=df_raw['volume']).on_balance_volume()
-df_raw['obv_slope'] = df_raw['obv'].diff(3)
-df_raw['volume_ratio'] = df_raw['volume'] / (df_raw['volume'].rolling(10).mean() + 1e-9)
-df_raw['volume_spike'] = (df_raw['volume_ratio'] > 1.8).astype(int)
-
-# VWAP
-df_raw['typical_price'] = (df_raw['high'] + df_raw['low'] + df_raw['close']) / 3
-df_raw['vwap'] = (df_raw['typical_price'] * df_raw['volume']).cumsum() / (df_raw['volume'].cumsum() + 1e-9)
-df_raw['vwap_dist'] = (df_raw['close'] - df_raw['vwap']) / (df_raw['vwap'] + 1e-9) * 100
-df_raw['price_above_vwap'] = (df_raw['close'] > df_raw['vwap']).astype(int)
-
-# Regime
-df_raw['rolling_std_10'] = df_raw['close'].pct_change().rolling(10).std() * 100
-df_raw['high_volatility'] = (df_raw['rolling_std_10'] > df_raw['rolling_std_10'].rolling(30).mean()).astype(int)
-
-# F&O proxies
-df_raw['oi_change_pct'] = np.random.uniform(-15, 15, n_samples)
-df_raw['pcr'] = np.random.uniform(0.5, 1.8, n_samples)
-
-df_raw = df_raw.fillna(0)
-
-# ── Feature columns matching the live feature engine ──────────────────────
 FEATURE_COLS = [
-    'return_1', 'return_3', 'return_5', 'body_size', 'hl_range', 'upper_wick', 'lower_wick',
-    'rsi', 'stoch_k', 'williams_r',
-    'macd', 'macd_diff', 'ema_cross', 'adx', 'adx_pos', 'adx_neg',
-    'atr', 'atr_pct', 'bb_width', 'bb_position',
-    'volume_spike', 'volume_ratio', 'obv_slope',
-    'vwap_dist', 'price_above_vwap',
-    'high_volatility',
-    'oi_change_pct', 'pcr',
+    "return_1", "return_3", "return_5",
+    "body_size", "hl_range", "upper_wick", "lower_wick",
+    "rsi", "stoch_k", "williams_r",
+    "macd", "macd_diff", "ema_cross",
+    "adx", "adx_pos", "adx_neg", "supertrend",
+    "atr", "atr_pct", "bb_width", "bb_position",
+    "volume_spike", "volume_ratio", "obv_slope",
+    "vwap_dist", "price_above_vwap",
+    "high_volatility",
+    "oi_change_pct", "pcr",
 ]
 
-# ── Target: forward return over next 5 bars ────────────────────────────────
-forward_return = df_raw['close'].pct_change(5).shift(-5)
-# Bullish: >0.3%, Bearish: <-0.3%, Neutral: otherwise
-conditions = [(forward_return > 0.003), (forward_return < -0.003)]
-df_raw['target'] = np.select(conditions, [1, -1], default=0)
+MODEL_DIR  = os.path.join(os.path.dirname(__file__), "..", "models")
+MODEL_FILE = os.path.join(MODEL_DIR, "lgbm_model.pkl")
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-df_model = df_raw[FEATURE_COLS + ['target']].dropna()
-X = df_model[FEATURE_COLS]
-y = df_model['target']
+TRADE_LOG = os.path.join(os.path.dirname(__file__), "..", "trade_log.jsonl")
 
-# ── 2. Walk-Forward (Time-Series) Cross Validation ─────────────────────────
-print(f"Dataset: {len(X)} samples, {len(FEATURE_COLS)} features")
-print("Using TimeSeriesSplit (5 folds) for walk-forward validation...")
 
-class_map = {-1: 0, 0: 1, 1: 2}
-y_mapped = y.map(class_map)
+# ─── Synthetic data generator ─────────────────────────────────────────────────
+def generate_synthetic_data(n=5000, seed=42):
+    np.random.seed(seed)
+    regime = np.random.choice(["trend_up", "trend_down", "range", "volatile"], n,
+                               p=[0.25, 0.25, 0.35, 0.15])
+    rows = []
+    for r in regime:
+        rsi       = np.random.normal(60 if r=="trend_up" else (40 if r=="trend_down" else 50), 12)
+        adx       = np.random.normal(30 if r in ("trend_up","trend_down") else 15, 8)
+        macd_diff = np.random.normal(0.5 if r=="trend_up" else (-0.5 if r=="trend_down" else 0), 0.3)
+        supertrend= 1 if r=="trend_up" else (-1 if r=="trend_down" else np.random.choice([-1,1]))
+        atr_pct   = np.random.normal(1.5 if r=="volatile" else 0.7, 0.25)
+
+        label = 2 if (r=="trend_up"  and rsi>55 and macd_diff>0) else \
+                0 if (r=="trend_down" and rsi<45 and macd_diff<0) else 1
+
+        rows.append({
+            "return_1": np.random.normal(0.002 if r=="trend_up" else -0.002, 0.005),
+            "return_3": np.random.normal(0.006 if r=="trend_up" else -0.006, 0.01),
+            "return_5": np.random.normal(0.010 if r=="trend_up" else -0.010, 0.015),
+            "body_size": np.random.uniform(0.1, 1.5), "hl_range": np.random.uniform(0.5, 2.0),
+            "upper_wick": np.random.uniform(0,1), "lower_wick": np.random.uniform(0,1),
+            "rsi": np.clip(rsi,10,90), "stoch_k": np.clip(np.random.normal(50,20),0,100),
+            "williams_r": np.random.uniform(-100,0),
+            "macd": np.random.normal(0,1), "macd_diff": macd_diff,
+            "ema_cross": np.random.normal(0,0.05), "adx": np.clip(adx,5,60),
+            "adx_pos": np.random.uniform(10,40), "adx_neg": np.random.uniform(10,40),
+            "supertrend": float(supertrend), "atr": np.random.uniform(50,200),
+            "atr_pct": np.clip(atr_pct,0.1,3.0),
+            "bb_width": np.random.uniform(2,10), "bb_position": np.random.uniform(0,1),
+            "volume_spike": int(np.random.rand()>0.85), "volume_ratio": np.random.uniform(0.5,3),
+            "obv_slope": np.random.normal(0,1000), "vwap_dist": np.random.normal(0,0.5),
+            "price_above_vwap": int(r=="trend_up" or np.random.rand()>0.5),
+            "high_volatility": int(r=="volatile"),
+            "oi_change_pct": np.random.uniform(-10,10), "pcr": np.random.uniform(0.5,1.8),
+            "__label__": label,
+        })
+    return pd.DataFrame(rows)
+
+
+# ─── Load real trade data ─────────────────────────────────────────────────────
+def load_real_trade_data():
+    if not os.path.exists(TRADE_LOG):
+        return None
+    rows = []
+    with open(TRADE_LOG) as f:
+        for line in f:
+            try:
+                entry = json.loads(line.strip())
+                order = entry.get("order", {})
+                signal = entry.get("signal", {})
+                features = signal.get("features", {}) if signal else {}
+                if not features or "pnl" not in order:
+                    continue
+                pnl = order["pnl"]
+                label = 2 if pnl > 500 else (0 if pnl < -300 else 1)
+                row = {col: float(features.get(col, 0)) for col in FEATURE_COLS}
+                row["__label__"] = label
+                rows.append(row)
+            except Exception:
+                pass
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    print(f"Loaded {len(df)} real trade samples from trade_log.jsonl")
+    return df
+
+
+# ─── Training ────────────────────────────────────────────────────────────────
+print(f"\n{'='*50}")
+print(f"  LightGBM Training  |  {'RETRAIN' if args.retrain else 'SYNTHETIC'}")
+print(f"{'='*50}")
+
+df_synth = generate_synthetic_data(n=5000)
+print(f"Synthetic data: {len(df_synth)} rows")
+
+if args.retrain:
+    df_real = load_real_trade_data()
+    if df_real is not None:
+        df = pd.concat([df_synth, df_real], ignore_index=True)
+        df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+        print(f"Combined dataset: {len(df)} rows")
+    else:
+        print("No real trade data found — using synthetic only")
+        df = df_synth
+else:
+    df = df_synth
+
+X = df[FEATURE_COLS].fillna(0)
+y = df["__label__"]
+
+model = LGBMClassifier(
+    n_estimators=400, learning_rate=0.04, max_depth=6,
+    num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+    class_weight="balanced", random_state=42,
+    n_jobs=-1, verbosity=-1,
+)
 
 tscv = TimeSeriesSplit(n_splits=5)
-fold_accuracies = []
-for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-    X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-    y_tr, y_val = y_mapped.iloc[train_idx], y_mapped.iloc[val_idx]
+fold_scores = []
+for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
+    Xtr, Xvl = X.iloc[train_idx], X.iloc[val_idx]
+    ytr, yvl = y.iloc[train_idx], y.iloc[val_idx]
+    model.fit(Xtr, ytr,
+              eval_set=[(Xvl, yvl)],
+              callbacks=[])
+    score = model.score(Xvl, yvl)
+    fold_scores.append(score)
+    print(f"  Fold {fold}: Accuracy = {score:.4f}")
 
-    fold_params = {
-        'objective': 'multiclass',
-        'num_class': 3,
-        'metric': 'multi_error',
-        'boosting_type': 'gbdt',
-        'learning_rate': 0.05,
-        'num_leaves': 63,
-        'max_depth': 6,
-        'feature_fraction': 0.7,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 5,
-        'min_child_samples': 30,
-        'class_weight': 'balanced',
-        'verbose': -1,
-        'random_state': 42,
-    }
+print(f"\n  Mean Accuracy: {sum(fold_scores)/len(fold_scores):.4f}")
 
-    tr_data = lgb.Dataset(X_tr, label=y_tr)
-    val_data = lgb.Dataset(X_val, label=y_val, reference=tr_data)
+# Final fit on full data
+model.fit(X, y)
 
-    fold_model = lgb.train(fold_params, tr_data, num_boost_round=300,
-                           valid_sets=[val_data],
-                           callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(period=-1)])
+# Feature importance
+imp_vals  = model.feature_importances_
+imp_ranked = sorted(zip(FEATURE_COLS, imp_vals), key=lambda x: x[1], reverse=True)[:10]
+print("\n  Top 10 Features:")
+for name, imp in imp_ranked:
+    print(f"    {name:<25} {imp:.0f}")
 
-    preds = np.argmax(fold_model.predict(X_val), axis=1)
-    acc = accuracy_score(y_val, preds)
-    fold_accuracies.append(acc)
-    print(f"  Fold {fold+1}: Accuracy = {acc:.4f}")
-
-print(f"\nMean CV Accuracy: {np.mean(fold_accuracies):.4f} ± {np.std(fold_accuracies):.4f}")
-
-# ── 3. Final Train on Full Dataset ─────────────────────────────────────────
-print("\nTraining final model on all data...")
-final_params = {
-    'objective': 'multiclass',
-    'num_class': 3,
-    'metric': 'multi_error',
-    'boosting_type': 'gbdt',
-    'learning_rate': 0.03,
-    'num_leaves': 63,
-    'max_depth': 6,
-    'feature_fraction': 0.7,
-    'bagging_fraction': 0.8,
-    'bagging_freq': 5,
-    'min_child_samples': 30,
-    'class_weight': 'balanced',
-    'verbose': -1,
-    'random_state': 42,
-}
-
-train_data = lgb.Dataset(X, label=y_mapped)
-final_model = lgb.train(final_params, train_data, num_boost_round=400,
-                        callbacks=[lgb.log_evaluation(period=50)])
-
-# ── 4. Evaluation on held-out last 20% ─────────────────────────────────────
-cutoff = int(len(X) * 0.8)
-X_test, y_test_mapped = X.iloc[cutoff:], y_mapped.iloc[cutoff:]
-y_pred = np.argmax(final_model.predict(X_test), axis=1)
-
-print("\n--- Final Model Evaluation (Last 20% of data) ---")
-print(f"Accuracy: {accuracy_score(y_test_mapped, y_pred):.4f}")
-print(classification_report(y_test_mapped, y_pred, target_names=["Bearish", "Neutral", "Bullish"]))
-
-# ── 5. Feature Importance ─────────────────────────────────────────────────
-print("Top 10 Feature Importances:")
-fi = pd.Series(final_model.feature_importance(importance_type='gain'), index=FEATURE_COLS).sort_values(ascending=False)
-for feat, score in fi.head(10).items():
-    print(f"  {feat:<25} {score:.0f}")
-
-# ── 6. Save Model ─────────────────────────────────────────────────────────
-os.makedirs("../models", exist_ok=True)
-model_path = "../models/lgbm_model.pkl"
-
-try:
-    from sklearn.base import BaseEstimator, ClassifierMixin
-
-    class LGBMWrapper(BaseEstimator, ClassifierMixin):
-        def __init__(self, model, feature_cols):
-            self.model = model
-            self.feature_cols = feature_cols
-            self.classes_ = np.array([-1, 0, 1])
-
-        def predict_proba(self, X):
-            return self.model.predict(X[self.feature_cols] if hasattr(X, 'columns') else X)
-
-        def predict(self, X):
-            probs = self.predict_proba(X)
-            return self.classes_[np.argmax(probs, axis=1)]
-
-    wrapped = LGBMWrapper(final_model, FEATURE_COLS)
-    joblib.dump(wrapped, model_path)
-    print(f"\nModel saved to {model_path}")
-except Exception as e:
-    print(f"Wrapper save failed: {e}. Saving native LightGBM model...")
-    final_model.save_model("../models/lgbm_model.txt")
-    print("Saved as ../models/lgbm_model.txt")
+# Save
+stamp = datetime.now().strftime("%Y%m%d_%H%M")
+ts_path = os.path.join(MODEL_DIR, f"lgbm_model_{stamp}.pkl")
+joblib.dump(model, MODEL_FILE)
+shutil.copy(MODEL_FILE, ts_path)
+print(f"\n  Saved: {MODEL_FILE}")
+print(f"  Backup: {ts_path}")

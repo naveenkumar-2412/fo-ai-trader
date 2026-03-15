@@ -687,3 +687,40 @@ h1, h2, h3, h4 {
 
 /* -- Empty text -- */
 .empty-text { color: var(--text-muted); font-size: 0.875rem; text-align: center; padding: 2rem; }
+
+/* -- Live Feed Tab -- */
+.live-feed-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+.headlines-list { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; max-height: 420px; overflow-y: auto; }
+.headline-row { display: flex; align-items: flex-start; gap: 0.6rem; padding: 0.5rem; border-radius: 6px; background: rgba(255,255,255,0.02); }
+.headline-row:hover { background: rgba(255,255,255,0.05); }
+.headline-dot { font-size: 0.9rem; flex-shrink: 0; margin-top: 2px; }
+.headline-text { font-size: 0.82rem; color: var(--text-muted); line-height: 1.4; flex: 1; text-decoration: none; }
+.headline-text:hover { color: var(--text-main); text-decoration: underline; }
+.headline-impact { font-size: 0.68rem; font-weight: 700; color: #ef4444; padding: 2px 5px; border-radius: 4px; background: rgba(239,68,68,0.15); flex-shrink: 0; align-self: flex-start; }
+.news-summary { font-size: 0.85rem; color: var(--text-muted); padding: 0.5rem; background: rgba(255,255,255,0.03); border-radius: 6px; margin-bottom: 0.5rem; }
+
+/* -- Events list -- */
+.events-list { display: flex; flex-direction: column; gap: 0.35rem; max-height: 420px; overflow-y: auto; margin-top: 0.5rem; }
+.event-row { display: grid; grid-template-columns: 80px 28px 120px 1fr; align-items: center; gap: 0.5rem; padding: 0.45rem 0.6rem; border-radius: 6px; font-size: 0.82rem; background: rgba(255,255,255,0.02); }
+.event-row:hover { background: rgba(255,255,255,0.04); }
+.event-time { color: var(--text-muted); font-size: 0.75rem; }
+.event-icon { font-size: 1rem; text-align: center; }
+.event-desc { font-weight: 600; color: var(--text-main); }
+.event-detail { color: var(--text-muted); font-size: 0.78rem; truncate; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* -- Multi-position cards grid -- */
+.trade-cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }
+
+/* -- MTF / News pills in header -- */
+.mtf-pill { margin-left: 0.75rem; padding: 2px 8px; border-radius: 10px; background: rgba(59,130,246,0.12); color: #60a5fa; font-size: 0.75rem; font-weight: 700; }
+.news-pill { margin-left: 0.5rem; padding: 2px 8px; border-radius: 10px; background: rgba(239,68,68,0.12); color: #f87171; font-size: 0.75rem; font-weight: 700; }
+
+/* -- Telegram status in sidebar -- */
+.notif-status { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; padding: 0.5rem; border-radius: 8px; background: rgba(255,255,255,0.03); }
+.notif-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.notif-dot.green { background: #10b981; }
+.notif-dot.grey  { background: #64748b; }
+.notif-label { font-size: 0.78rem; color: var(--text-muted); }
+
+/* -- MTF tag on trend label -- */
+.mtf-tag { font-size: 0.78rem; color: var(--text-muted); font-weight: 400; }

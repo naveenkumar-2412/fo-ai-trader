@@ -1,67 +1,77 @@
 @echo off
-echo Starting AI F^&O Trading System...
+echo ============================================================
+echo   AI F^&O Trading System — Starting All Services
+echo ============================================================
 
-echo Waiting 2 seconds for services to start sequentially...
+cd /d %~dp0
 
-echo [1/9] Starting Market Data MCP (Port 8001)...
-start cmd /k "cd /d %~dp0 && python mcp_market_data/api.py"
+echo [1/11] Starting Market Data MCP (port 8001)...
+start "Market Data" cmd /k "cd mcp_market_data && python api.py"
 timeout /t 2 /nobreak >nul
 
-echo [2/9] Starting News MCP (Port 8008)...
-start cmd /k "cd /d %~dp0 && python mcp_news/api.py"
+echo [2/11] Starting Feature Engine MCP (port 8002)...
+start "Feature Engine" cmd /k "cd mcp_features && python api.py"
 timeout /t 2 /nobreak >nul
 
-echo [3/9] Starting Event Bus MCP (Port 8009)...
-start cmd /k "cd /d %~dp0 && python mcp_event_bus/api.py"
+echo [3/11] Starting Prediction MCP (port 8003)...
+start "Prediction" cmd /k "cd mcp_prediction && python api.py"
 timeout /t 2 /nobreak >nul
 
-echo [4/9] Starting Feature Engine MCP (Port 8002)...
-start cmd /k "cd /d %~dp0 && python mcp_features/api.py"
+echo [4/11] Starting Strategy MCP (port 8004)...
+start "Strategy" cmd /k "cd mcp_strategy && python api.py"
 timeout /t 2 /nobreak >nul
 
-echo [5/9] Starting Prediction MCP (Port 8003)...
-start cmd /k "cd /d %~dp0 && python mcp_prediction/api.py"
+echo [5/11] Starting Risk Manager MCP (port 8005)...
+start "Risk Manager" cmd /k "cd mcp_risk && python api.py"
 timeout /t 2 /nobreak >nul
 
-echo [6/9] Starting Strategy MCP (Port 8004)...
-start cmd /k "cd /d %~dp0 && python mcp_strategy/api.py"
+echo [6/11] Starting Execution MCP (port 8006)...
+start "Execution" cmd /k "cd mcp_execution && python api.py"
 timeout /t 2 /nobreak >nul
 
-echo [7/9] Starting Risk Manager MCP (Port 8005)...
-start cmd /k "cd /d %~dp0 && python mcp_risk/api.py"
+echo [7/11] Starting Dashboard API Gateway (port 8007)...
+start "Dashboard API" cmd /k "cd mcp_dashboard_api && python api.py"
 timeout /t 2 /nobreak >nul
 
-echo [8/9] Starting Execution MCP (Port 8006)...
-start cmd /k "cd /d %~dp0 && python mcp_execution/api.py"
+echo [8/11] Starting News MCP (port 8008)...
+start "News MCP" cmd /k "cd mcp_news && python api.py"
 timeout /t 2 /nobreak >nul
 
-echo [9/9] Starting Dashboard API Gateway (Port 8007)...
-start cmd /k "cd /d %~dp0 && python mcp_dashboard_api/api.py"
+echo [9/11] Starting Event Bus MCP (port 8009)...
+start "Event Bus" cmd /k "cd mcp_event_bus && python api.py"
 timeout /t 2 /nobreak >nul
+
+echo [10/11] Starting Notifications MCP (port 8010)...
+start "Notifications" cmd /k "cd mcp_notifications && python api.py"
+timeout /t 2 /nobreak >nul
+
+echo [11/11] Starting React Dashboard (port 5173)...
+start "Dashboard UI" cmd /k "cd dashboard-ui && npm run dev"
+timeout /t 4 /nobreak >nul
 
 echo.
-echo [UI] Starting React Dashboard (Port 5173)...
-start cmd /k "cd /d %~dp0\dashboard-ui && node node_modules/vite/bin/vite.js"
-timeout /t 3 /nobreak >nul
-
+echo ============================================================
+echo   All Services Running
+echo ============================================================
+echo   Market Data     : http://localhost:8001/docs
+echo   Feature Engine  : http://localhost:8002/docs
+echo   Prediction      : http://localhost:8003/docs
+echo   Strategy        : http://localhost:8004/docs
+echo   Risk Manager    : http://localhost:8005/docs
+echo   Execution       : http://localhost:8006/docs
+echo   Dashboard API   : http://localhost:8007/docs
+echo   News MCP        : http://localhost:8008/docs
+echo   Event Bus       : http://localhost:8009/docs
+echo   Notifications   : http://localhost:8010/docs
+echo   React Dashboard : http://localhost:5173
+echo ============================================================
 echo.
-echo =====================================================
-echo  All services started successfully!
-echo  React Dashboard  : http://localhost:5173
-echo  API Gateway      : http://localhost:8007
-echo  Market Data API  : http://localhost:8001/docs
-echo  News API         : http://localhost:8008/docs
-echo  Event Bus API    : http://localhost:8009/docs
-echo  Feature Engine   : http://localhost:8002/docs
-echo  Prediction API   : http://localhost:8003/docs
-echo  Strategy API     : http://localhost:8004/docs
-echo  Risk Manager     : http://localhost:8005/docs
-echo  Execution API    : http://localhost:8006/docs
-echo =====================================================
+echo   To start trading:
+echo     python main_orchestrator.py           (NIFTY)
+echo     python main_orchestrator.py --symbol BANKNIFTY
+echo     python main_orchestrator.py --dry-run (paper trading)
 echo.
-echo [ORCHESTRATOR] To start trading, open a new terminal and run:
-echo    python main_orchestrator.py
-echo [SIMULATION] Real-time prediction simulation (no real orders):
-echo    python main_orchestrator.py --simulation --symbol NIFTY --interval-sec 15
-echo.
+echo   To retrain model after market close:
+echo     training\retrain_daily.bat
+echo ============================================================
 pause
